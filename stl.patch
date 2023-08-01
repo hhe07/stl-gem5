@@ -1,0 +1,240 @@
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+index ab165bbcd5..c69e1f4513 100644
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -186,6 +186,7 @@ class DynInst : public ExecContext, public RefCounted
+         ReqMade,
+         MemOpDone,
+         HtmFromTransaction,
++        CheckingViolations
+         MaxFlags
+     };
+
+@@ -380,6 +381,10 @@ class DynInst : public ExecContext, public RefCounted
+     bool notAnInst() const { return instFlags[NotAnInst]; }
+     void setNotAnInst() { instFlags[NotAnInst] = true; }
+
++    // violation checking
++    bool checkingViolations() const{return instFlags[CheckingViolations];}
++    void checkingViolations(bool f){ instFlags[CheckingViolations] = f;}
++
+
+     ////////////////////////////////////////////
+     //
+diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
+index 7cf6c54542..49f8e078c3 100644
+--- a/src/cpu/o3/iew.cc
++++ b/src/cpu/o3/iew.cc
+@@ -1211,6 +1211,7 @@ IEW::executeInsts()
+             } else if (inst->isLoad()) {
+                 // Loads will mark themselves as executed, and their writeback
+                 // event adds the instruction to the queue to commit
++
+                 fault = ldstQueue.executeLoad(inst);
+
+                 if (inst->isTranslationDelayed() &&
+@@ -1222,6 +1223,10 @@ IEW::executeInsts()
+                     instQueue.deferMemInst(inst);
+                     continue;
+                 }
++                if (inst->checkingViolations()){
++                    DPRINTF(IEW,"Execute: Instruction %llx is currently checking violations.\n", inst->pcState());
++                }
++
+
+                 if (inst->isDataPrefetch() || inst->isInstPrefetch()) {
+                     inst->fault = NoFault;
+@@ -1238,6 +1243,10 @@ IEW::executeInsts()
+                     instQueue.deferMemInst(inst);
+                     continue;
+                 }
++                if (inst->checkingViolations()){
++                    DPRINTF(IEW,"Execute: Instruction %llx is currently checking violations.\n", inst->pcState());
++                }
++
+
+                 // If the store had a fault then it may not have a mem req
+                 if (fault != NoFault || !inst->readPredicate() ||
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 139e0de337..f41238ab12 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -518,67 +518,64 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
+      * all instructions that will execute before the store writes back. Thus,
+      * like the implementation that came before it, we're overly conservative.
+      */
+-    while (loadIt != loadQueue.end()) {
+-        DynInstPtr ld_inst = loadIt->instruction();
+-        if (!ld_inst->effAddrValid() || ld_inst->strictlyOrdered()) {
+-            ++loadIt;
+-            continue;
+-        }
++    DynInstPtr ld_inst = loadIt->instruction();
++    if (!ld_inst->effAddrValid() || ld_inst->strictlyOrdered()) {
++        ++loadIt;
++        continue;
++    }
+
+-        Addr ld_eff_addr1 = ld_inst->effAddr >> depCheckShift;
+-        Addr ld_eff_addr2 =
+-            (ld_inst->effAddr + ld_inst->effSize - 1) >> depCheckShift;
+-
+-        if (inst_eff_addr2 >= ld_eff_addr1 && inst_eff_addr1 <= ld_eff_addr2) {
+-            if (inst->isLoad()) {
+-                // If this load is to the same block as an external snoop
+-                // invalidate that we've observed then the load needs to be
+-                // squashed as it could have newer data
+-                if (ld_inst->hitExternalSnoop()) {
+-                    if (!memDepViolator ||
+-                            ld_inst->seqNum < memDepViolator->seqNum) {
+-                        DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] "
+-                                "and [sn:%lli] at address %#x\n",
+-                                inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+-                        memDepViolator = ld_inst;
+-
+-                        ++stats.memOrderViolation;
+-
+-                        return std::make_shared<GenericISA::M5PanicFault>(
+-                            "Detected fault with inst [sn:%lli] and "
+-                            "[sn:%lli] at address %#x\n",
++    Addr ld_eff_addr1 = ld_inst->effAddr >> depCheckShift;
++    Addr ld_eff_addr2 =
++        (ld_inst->effAddr + ld_inst->effSize - 1) >> depCheckShift;
++
++    if (inst_eff_addr2 >= ld_eff_addr1 && inst_eff_addr1 <= ld_eff_addr2) {
++        if (inst->isLoad()) {
++            // If this load is to the same block as an external snoop
++            // invalidate that we've observed then the load needs to be
++            // squashed as it could have newer data
++            if (ld_inst->hitExternalSnoop()) {
++                if (!memDepViolator ||
++                        ld_inst->seqNum < memDepViolator->seqNum) {
++                    DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] "
++                            "and [sn:%lli] at address %#x\n",
+                             inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+-                    }
+-                }
++                    memDepViolator = ld_inst;
+
+-                // Otherwise, mark the load has a possible load violation and
+-                // if we see a snoop before it's commited, we need to squash
+-                ld_inst->possibleLoadViolation(true);
+-                DPRINTF(LSQUnit, "Found possible load violation at addr: %#x"
+-                        " between instructions [sn:%lli] and [sn:%lli]\n",
+-                        inst_eff_addr1, inst->seqNum, ld_inst->seqNum);
+-            } else {
+-                // A load/store incorrectly passed this store.
+-                // Check if we already have a violator, or if it's newer
+-                // squash and refetch.
+-                if (memDepViolator && ld_inst->seqNum > memDepViolator->seqNum)
+-                    break;
++                    ++stats.memOrderViolation;
+
+-                DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] and "
++                    return std::make_shared<GenericISA::M5PanicFault>(
++                        "Detected fault with inst [sn:%lli] and "
+                         "[sn:%lli] at address %#x\n",
+                         inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+-                memDepViolator = ld_inst;
++                }
++            }
++
++            // Otherwise, mark the load has a possible load violation and
++            // if we see a snoop before it's commited, we need to squash
++            ld_inst->possibleLoadViolation(true);
++            DPRINTF(LSQUnit, "Found possible load violation at addr: %#x"
++                    " between instructions [sn:%lli] and [sn:%lli]\n",
++                    inst_eff_addr1, inst->seqNum, ld_inst->seqNum);
++        } else {
+
+-                ++stats.memOrderViolation;
++            // A load/store incorrectly passed this store.
++            // Check if we already have a violator, or if it's newer
++            // squash and refetch.
++            if (memDepViolator && ld_inst->seqNum > memDepViolator->seqNum)
++                break;
+
+-                return std::make_shared<GenericISA::M5PanicFault>(
+-                    "Detected fault with "
+-                    "inst [sn:%lli] and [sn:%lli] at address %#x\n",
++            DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] and "
++                    "[sn:%lli] at address %#x\n",
+                     inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+-            }
+-        }
++            memDepViolator = ld_inst;
+
+-        ++loadIt;
++            ++stats.memOrderViolation;
++
++            return std::make_shared<GenericISA::M5PanicFault>(
++                "Detected fault with "
++                "inst [sn:%lli] and [sn:%lli] at address %#x\n",
++                inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
++        }
+     }
+     return NoFault;
+ }
+@@ -661,6 +658,17 @@ LSQUnit::executeStore(const DynInstPtr &store_inst)
+
+     ssize_t store_idx = store_inst->sqIdx;
+
++    if (store_inst->checkingViolations()){
++        if (loadIt == loadQueue.end()){
++            DPRINTF(LSQUnit, "Finished checking violations for store PC %s [sn:%lli]\n",
++                    store_inst->pcState(), store_inst->seqNum);
++            store_inst->checkViolations(false);
++        }
++        DPRINTF(LSQUnit, "Checking violations for store PC %s [sn:%lli]\n",
++                store_inst->pcState(), store_inst->seqNum);
++        return checkViolations(store_inst->lqIt++, inst);
++    }
++
+     DPRINTF(LSQUnit, "Executing store PC %s [sn:%lli]\n",
+             store_inst->pcState(), store_inst->seqNum);
+
+@@ -711,7 +719,8 @@ LSQUnit::executeStore(const DynInstPtr &store_inst)
+         ++storesToWB;
+     }
+
+-    return checkViolations(loadIt, store_inst);
++    store_inst->checkingViolations(true);
++    return store_fault;
+
+ }
+
+@@ -1466,8 +1475,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+                         store_it->data() + shift_amt,
+                         request->mainReq()->getSize());
+
+-                DPRINTF(LSQUnit, "Forwarding from store idx %i to load to "
+-                        "addr %#x\n", store_it._idx,
++                DPRINTF(LSQUnit, "Forwarding from store idx %i (%08llx) to load to "
++                        "addr %#x\n", store_it._idx, store_it->instruction()->pcState().instAddr(),
+                         request->mainReq()->getVaddr());
+
+                 PacketPtr data_pkt = new Packet(request->mainReq(),
+diff --git a/src/cpu/o3/mem_dep_unit.cc b/src/cpu/o3/mem_dep_unit.cc
+index bffbf2380d..dc538fe5f3 100644
+--- a/src/cpu/o3/mem_dep_unit.cc
++++ b/src/cpu/o3/mem_dep_unit.cc
+@@ -284,7 +284,7 @@ MemDepUnit::insert(const DynInstPtr &inst)
+
+     if (inst->isStore() || inst->isAtomic()) {
+         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
+-                inst->pcState(), inst->seqNum);
++                (inst->isStore() ? "store")inst->pcState(), inst->seqNum);
+
+         depPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
+                 inst->threadNumber);
+diff --git a/src/mem/ruby/common/Histogram.hh b/src/mem/ruby/common/Histogram.hh
+index bfd3ae0aba..e8679adce9 100644
+--- a/src/mem/ruby/common/Histogram.hh
++++ b/src/mem/ruby/common/Histogram.hh
+@@ -31,6 +31,7 @@
+
+ #include <iostream>
+ #include <vector>
++#include <cstdint>
+
+ #include "mem/ruby/common/TypeDefines.hh"
